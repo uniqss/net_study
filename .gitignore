@@ -32,3 +32,4 @@
 *.app
 
 opt/asio-1.28.0
+src/bin/
