@@ -86,7 +86,8 @@
 			"thread": "cpp",
 			"typeinfo": "cpp",
 			"variant": "cpp",
-			"*.ipp": "cpp"
+			"*.ipp": "cpp",
+			"unordered_set": "cpp"
 		}
 	}
 }

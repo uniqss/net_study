@@ -9,6 +9,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <deque>
+#include <memory>
 
 #include "simple_log.h"
 
@@ -84,6 +85,7 @@ class client : public std::enable_shared_from_this<client> {
             }
         } catch (const std::exception& e) {
             elog("client_proc_connect error:", e.what());
+            m_skt.close();
         }
     }
 
@@ -155,9 +157,27 @@ class client : public std::enable_shared_from_this<client> {
         }
     }
 
+    awaitable<void> client_proc() {
+        auto executor = m_skt.get_executor();
+        try {
+            for (;;) {
+                if (!m_skt.is_open()) {
+                    co_spawn(
+                        m_skt.get_executor(), [self = shared_from_this()] { return self->client_proc_connect(); },
+                        detached);
+                }
+                asio::steady_timer timer(executor);
+                timer.expires_after(std::chrono::seconds(1));
+                co_await timer.async_wait(use_awaitable);
+            }
+        } catch (const std::exception& e) {
+            elog("client_proc_write error:", e.what());
+        }
+    }
+
     void start() {
         co_spawn(
-            m_skt.get_executor(), [self = shared_from_this()] { return self->client_proc_connect(); }, detached);
+            m_skt.get_executor(), [self = shared_from_this()] { return self->client_proc(); }, detached);
         co_spawn(
             m_skt.get_executor(), [self = shared_from_this()] { return self->addmsg_forsend(); }, detached);
 
