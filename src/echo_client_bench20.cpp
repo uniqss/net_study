@@ -67,9 +67,10 @@ class client : public std::enable_shared_from_this<client> {
             for (;;) {
                 if (!m_skt.is_open()) {
                     tcp::resolver resolver(executor);
-                    asio::connect(m_skt, resolver.resolve(m_host, m_port));
-                    ilog("open and connecting cidx:", m_cidx);
-                    if (m_skt.is_open()) {
+                    asio::error_code ec;
+                    asio::connect(m_skt, resolver.resolve(m_host, m_port), ec);
+                    ilog("open and connecting cidx:", m_cidx, "ec:", ec.value());
+                    if (!ec && m_skt.is_open()) {
                         co_spawn(
                             m_skt.get_executor(), [self = shared_from_this()] { return self->client_proc_read(); },
                             detached);
@@ -83,6 +84,10 @@ class client : public std::enable_shared_from_this<client> {
                 timer.expires_after(std::chrono::seconds(1));
                 co_await timer.async_wait(use_awaitable);
             }
+        } catch (const asio::system_error& ec) {
+            if (ec.code() == asio::error::connection_refused) {
+            }
+            elog("client_proc_connect asio::system_error error:", ec.code(), " error.msg:", ec.what());
         } catch (const std::exception& e) {
             elog("client_proc_connect error:", e.what());
             m_skt.close();
@@ -156,6 +161,7 @@ class client : public std::enable_shared_from_this<client> {
         }
     }
 
+    // 4 coroutines
     awaitable<void> client_proc() {
         auto executor = m_skt.get_executor();
         try {
@@ -170,13 +176,41 @@ class client : public std::enable_shared_from_this<client> {
                 co_await timer.async_wait(use_awaitable);
             }
         } catch (const std::exception& e) {
-            elog("client_proc_write error:", e.what());
+            elog("client_proc error:", e.what());
+        }
+    }
+
+    // 3 coroutines
+    awaitable<void> client_proc_c3() {
+        auto executor = m_skt.get_executor();
+        try {
+            for (;;) {
+                if (!m_skt.is_open()) {
+                    tcp::resolver resolver(executor);
+                    asio::error_code ec;
+                    asio::connect(m_skt, resolver.resolve(m_host, m_port), ec);
+                    ilog("open and connecting cidx:", m_cidx, " ec:", ec.value(), "|", ec.message());
+                    if (!ec && m_skt.is_open()) {
+                        co_spawn(
+                            m_skt.get_executor(), [self = shared_from_this()] { return self->client_proc_read(); },
+                            detached);
+                        co_spawn(
+                            m_skt.get_executor(), [self = shared_from_this()] { return self->client_proc_write(); },
+                            detached);
+                    }
+                }
+                asio::steady_timer timer(executor);
+                timer.expires_after(std::chrono::seconds(1));
+                co_await timer.async_wait(use_awaitable);
+            }
+        } catch (const std::exception& e) {
+            elog("client_proc_c3 error:", e.what());
         }
     }
 
     void start() {
         co_spawn(
-            m_skt.get_executor(), [self = shared_from_this()] { return self->client_proc(); }, detached);
+            m_skt.get_executor(), [self = shared_from_this()] { return self->client_proc_c3(); }, detached);
         co_spawn(
             m_skt.get_executor(), [self = shared_from_this()] { return self->addmsg_forsend(); }, detached);
 
