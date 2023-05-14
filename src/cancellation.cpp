@@ -15,7 +15,7 @@ int main() {
         co_await acceptor.async_accept(socket, use_awaitable);
         uint32_t counter = 0;
         for (;;) {
-            std::vector<std::uint32_t> data(1024 * 1024 * 4);
+            std::vector<std::uint32_t> data(1024 * 1024 * 400);
             std::ranges::generate(data, [&counter]() { return counter++; });
             const auto [error, bytesTransfered] = co_await async_write(
                 socket, buffer(data), bind_cancellation_slot(signal.slot(), as_tuple(use_awaitable)));
@@ -33,7 +33,7 @@ int main() {
         co_await socket.async_connect(ip::tcp::endpoint(ip::address::from_string("127.0.0.1"), 1234), use_awaitable);
         uint32_t i = 0;
         for (;;) {
-            std::vector<std::uint32_t> data(1024 * 1024 * 4);
+            std::vector<std::uint32_t> data(1024 * 1024 * 400);
             co_await async_read(socket, buffer(data), use_awaitable);
             for (const auto value : data) {
                 if (value != i++) {

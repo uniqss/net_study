@@ -107,7 +107,6 @@ class client : public std::enable_shared_from_this<client> {
                         // dlog("everything is ok cidx:", m_cidx);
                         ++ok_count;
                     }
-                    m_writemsgs.push_back(m_buffReply);
                 }
                 asio::steady_timer timer(executor);
                 timer.expires_after(std::chrono::seconds(1));
@@ -153,7 +152,7 @@ class client : public std::enable_shared_from_this<client> {
                 co_await timer.async_wait(use_awaitable);
             }
         } catch (const std::exception& e) {
-            elog("client_proc_write error:", e.what());
+            elog("addmsg_forsend error:", e.what());
         }
     }
 
