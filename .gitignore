@@ -33,3 +33,5 @@
 
 opt/asio-1.28.0
 src/bin/
+/win/x64
+/win/.vs
