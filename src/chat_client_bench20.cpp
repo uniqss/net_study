@@ -1,171 +1,256 @@
-#include <asio.hpp>
-#include <set>
+#include "asio.hpp"
+#include <asio/co_spawn.hpp>
+#include <asio/detached.hpp>
+#include <asio/io_context.hpp>
+#include <asio/ip/tcp.hpp>
+#include <asio/signal_set.hpp>
+#include <asio/write.hpp>
+#include <cstdio>
+#include <unordered_set>
+#include <unordered_map>
 #include <deque>
-#include <iostream>
+#include <memory>
+
+#include "simple_log.h"
 
 using asio::awaitable;
 using asio::co_spawn;
 using asio::detached;
-using asio::redirect_error;
 using asio::use_awaitable;
 using asio::ip::tcp;
 namespace this_coro = asio::this_coro;
 
+enum { max_length = 1024 };
+
 int max_client_count = 10000;
 int ok_count = 0;
 int64_t ok_count_total = 0;
+bool gworking = false;
+
+void setdebugging() {
+    if (max_client_count <= 10) goDebugging = true;
+}
 
 awaitable<void> print_proc() {
     auto executor = co_await this_coro::executor;
-    for (;;) {
+    int ok_count_0 = 0;
+    for (; gworking;) {
         asio::steady_timer timer(executor);
         timer.expires_after(std::chrono::seconds(1));
         co_await timer.async_wait(use_awaitable);
 
+        if (ok_count == 0) {
+            ++ok_count_0;
+        } else {
+            ok_count_0 = 0;
+        }
+        bool need_print = ok_count_0 <= 3;
+
         ok_count_total += ok_count;
-        std::cout << "ok_count:" << ok_count << " ok_count_total:" << ok_count_total << std::endl;
+        if (need_print) {
+            ilog("ok_count:", ok_count, " ok_count_total:", ok_count_total);
+        }
         ok_count = 0;
     }
 }
 
-class chat_participant {
+class IClient {
    public:
-    virtual ~chat_participant() {}
-    virtual void deliver(const std::string& msg) = 0;
+    virtual ~IClient() {}
+    virtual void start() = 0;
+    virtual void stop() = 0;
 };
 
-using chat_participant_ptr = std::shared_ptr<chat_participant>;
+using clientPtr = std::shared_ptr<IClient>;
+std::unordered_map<int, clientPtr> gClients;
 
-class chat_room {
+class client : public IClient, public std::enable_shared_from_this<client> {
    public:
-    void join(chat_participant_ptr participant) {
-        participants_.insert(participant);
-        for (auto& msg : recent_msgs_) {
-            participant->deliver(msg);
-        }
+    client(int cidx, asio::io_context& ctx, const auto& host, const auto& port)
+        : m_ctx(ctx), m_cidx(cidx), m_skt(ctx), m_host(host), m_port(port), m_reading(false), m_writing(false) {
+        std::memset(m_buffRequest, 'a' + ((cidx) % 26), max_length);
+        m_buffRequest[max_length - 1] = '\0';
     }
-    void leave(chat_participant_ptr participant) { participants_.erase(participant); }
+    ~client() { dlog("~client cidx:", m_cidx); }
 
-    void deliver(const std::string& msg) {
-        recent_msgs_.push_back(msg);
-        while (recent_msgs_.size() > max_recent_msgs) {
-            recent_msgs_.pop_front();
-        }
-        for (auto participant : participants_) {
-            participant->deliver(msg);
-        }
-    }
-
-   private:
-    std::set<chat_participant_ptr> participants_;
-    enum { max_recent_msgs = 100 };
-    std::deque<std::string> recent_msgs_;
-};
-
-class chat_session : public chat_participant, public std::enable_shared_from_this<chat_session> {
-   public:
-    chat_session(tcp::socket socket, chat_room& room)
-        : socket_(std::move(socket)), timer_(socket.get_executor()), room_(room) {
-        timer_.expires_at(std::chrono::steady_clock::time_point::max());
-    }
-
-    void start() {
-        room_.join(shared_from_this());
-
-        co_spawn(
-            socket_.get_executor(), [self = shared_from_this()] { return self->reader(); }, detached);
-
-        co_spawn(
-            socket_.get_executor(), [self = shared_from_this()] { return self->writer(); }, detached);
-    }
-
-    virtual void deliver(const std::string& msg) {
-        write_msgs_.push_back(msg);
-        timer_.cancel_one();
-    }
-
-   private:
-    awaitable<void> reader() {
+    awaitable<void> do_read() {
+        if (m_reading) co_return;
+        m_reading = true;
+        auto executor = m_skt.get_executor();
         try {
-            std::string read_msg;
-            for (;;) {
-                std::size_t n =
-                    co_await asio::async_read_until(socket_, asio::dynamic_buffer(read_msg, 1024), "\n", use_awaitable);
-                room_.deliver(read_msg);
-                read_msg.erase(0, n);
-            }
-        } catch (const std::exception& e) {
-            stop();
-        }
-    }
-
-    awaitable<void> writer() {
-        try {
-            while (socket_.is_open()) {
-                if (write_msgs_.empty()) {
-                    asio::error_code ec;
-                    co_await timer_.async_wait(redirect_error(use_awaitable, ec));
+            for (; gworking;) {
+                if (m_skt.is_open()) {
+                    dlog("pre async_read cidx:", m_cidx);
+                    size_t reply_length =
+                        co_await asio::async_read(m_skt, asio::buffer(m_buffReply, max_length), use_awaitable);
+                    dlog("post async_read cidx:", m_cidx);
+                    if (reply_length != max_length) {
+                        elog("reply_length != max_length reply_length:", reply_length);
+                    }
+                    if (strncmp(m_buffReply, m_buffRequest, max_length) != 0) {
+                        elog("reply not match request reply:", m_buffReply, " request:", m_buffRequest);
+                    } else {
+                        // dlog("everything is ok cidx:", m_cidx);
+                        ++ok_count;
+                    }
                 } else {
-                    co_await asio::async_write(socket_, asio::buffer(write_msgs_.front()), use_awaitable);
-                    write_msgs_.pop_front();
+                    dlog("do_read m_skt is not open cidx:", m_cidx);
                 }
+                asio::steady_timer timer(executor);
+                timer.expires_after(std::chrono::seconds(1));
+                co_await timer.async_wait(use_awaitable);
             }
+            m_reading = false;
         } catch (const std::exception& e) {
-            stop();
+            elog("do_read error:", e.what());
+            m_skt.close();
+            m_reading = false;
         }
     }
 
-    void stop() {
-        room_.leave(shared_from_this());
-        socket_.close();
-        timer_.cancel();
+    awaitable<void> do_write() {
+        if (m_writing) co_return;
+        m_writing = true;
+        auto executor = m_skt.get_executor();
+        try {
+            for (; gworking;) {
+                if (m_skt.is_open()) {
+                    dlog("do_write 111 cidx:", m_cidx);
+                    if (!m_writemsgs.empty()) {
+                        std::string msg = m_writemsgs.front();
+                        m_writemsgs.pop_front();
+                        dlog("pre async_write cidx:", m_cidx);
+                        co_await asio::async_write(m_skt, asio::buffer(msg.data(), max_length), use_awaitable);
+                        dlog("post async_write cidx:", m_cidx);
+                    } else {
+                        dlog("m_writemsgs.empty() cidx:", m_cidx);
+                    }
+                } else {
+                    dlog("do_write m_skt is not open cidx:", m_cidx);
+                }
+                asio::steady_timer timer(executor);
+                timer.expires_after(std::chrono::seconds(1));
+                co_await timer.async_wait(use_awaitable);
+            }
+            m_writing = false;
+        } catch (const std::exception& e) {
+            elog("do_write error:", e.what());
+            m_skt.close();
+            m_writing = false;
+        }
+    }
+
+    awaitable<void> addmsg_forsend() {
+        auto executor = m_skt.get_executor();
+        try {
+            for (; gworking;) {
+                dlog("addmsg_forsend 111 cidx:", m_cidx);
+                if (m_writemsgs.size() < 2) m_writemsgs.push_back(m_buffRequest);
+
+                asio::steady_timer timer(executor);
+                timer.expires_after(std::chrono::seconds(1));
+                co_await timer.async_wait(use_awaitable);
+            }
+        } catch (const std::exception& e) {
+            elog("addmsg_forsend error:", e.what());
+        }
+    }
+
+    awaitable<void> do_connect() {
+        auto executor = m_skt.get_executor();
+        try {
+            for (; gworking;) {
+                if (!m_skt.is_open()) {
+                    m_ec.clear();
+                    m_skt.connect(asio::ip::tcp::endpoint(asio::ip::address::from_string(m_host), m_port), m_ec);
+                    ilog("open and connecting cidx:", m_cidx, " ec:", m_ec.value(), "|", m_ec.message());
+                    
+                    if (!m_ec) {
+                        co_spawn(
+                            m_skt.get_executor(), [self = shared_from_this()] { return self->do_read(); }, detached);
+                        co_spawn(
+                            m_skt.get_executor(), [self = shared_from_this()] { return self->do_write(); }, detached);
+                    } else {
+                        m_skt.close();
+                    }
+                } else {
+                    dlog("do_connect m_skt is open cidx:", m_cidx);
+                }
+                asio::steady_timer timer(executor);
+                timer.expires_after(std::chrono::seconds(5));
+                co_await timer.async_wait(use_awaitable);
+            }
+        } catch (const std::exception& e) {
+            elog("connector error:", e.what());
+        }
+    }
+
+    virtual void start() {
+        gClients[m_cidx] = shared_from_this();
+        co_spawn(
+            m_skt.get_executor(), [self = shared_from_this()] { return self->do_connect(); }, detached);
+        co_spawn(
+            m_skt.get_executor(), [self = shared_from_this()] { return self->addmsg_forsend(); }, detached);
+
+        ilog("client_proc exiting cidx:", m_cidx);
+    }
+    virtual void stop() {
+        if (m_skt.is_open()) {
+            m_skt.close();
+        }
     }
 
    private:
-    tcp::socket socket_;
-    asio::steady_timer timer_;
-    chat_room& room_;
-    std::deque<std::string> write_msgs_;
+    asio::io_context& m_ctx;
+    int m_cidx;
+    tcp::socket m_skt;
+    std::string m_host;
+    uint16_t m_port;
+    char m_buffRequest[max_length];
+    char m_buffReply[max_length];
+    std::deque<std::string> m_writemsgs;
+    asio::error_code m_ec;
+    bool m_reading;
+    bool m_writing;
 };
 
-
-awaitable<void> client_proc(int cidx, auto& ctx, auto host, auto port) {
-    auto executor = co_await this_coro::executor;
-    // std::cout << "client_proc cidx:" << cidx << std::endl;
-    std::unique_ptr<tcp::socket> skt;
-
-    co_spawn(
-        socket_.get_executor(), [self = shared_from_this()] { return self->reader(); }, detached);
-
-    co_spawn(
-        socket_.get_executor(), [self = shared_from_this()] { return self->writer(); }, detached);
-}
-
-int main(int argc, const char** argv) {
+int main(int argc, char* argv[]) {
     try {
         std::string host = "127.0.0.1";
-        std::string port = "8888";
+        uint16_t port = 8888;
         if (argc >= 4) {
             host = argv[1];
-            port = argv[2];
+            port = (uint16_t)atoi(argv[2]);
             max_client_count = atoi(argv[3]);
             if (max_client_count < 2) max_client_count = 2;
         }
 
+        setdebugging();
+
+        gworking = true;
+
         asio::io_context io_context(1);
 
         asio::signal_set signals(io_context, SIGINT, SIGTERM);
-        signals.async_wait([&](auto, auto) { io_context.stop(); });
+        signals.async_wait([&](auto, auto) {
+            gworking = false;
+            for (auto c : gClients) {
+                c.second->stop();
+            }
+
+            io_context.stop();
+        });
 
         for (int i = 1; i <= max_client_count; ++i) {
-            co_spawn(io_context, client_proc(i, io_context, host, port), detached);
+            auto c = std::make_shared<client>(i, io_context, host, port);
+            c->start();
         }
 
         co_spawn(io_context, print_proc(), detached);
 
         io_context.run();
-    } catch (const std::exception& e) {
-        std::cout << "exception:" << e.what() << std::endl;
+    } catch (std::exception& e) {
+        elog("Exception: ", e.what());
     }
 
     return 0;
